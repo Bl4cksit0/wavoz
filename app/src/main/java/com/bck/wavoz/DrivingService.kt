@@ -11,6 +11,9 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /** Servicio en primer plano ("modo conducción"): mantiene vivo el asistente y permite usar el micrófono. */
 class DrivingService : Service() {
@@ -22,7 +25,10 @@ class DrivingService : Service() {
         const val A_SILENCE = "silence"
         const val A_STOP = "stop"
         const val A_TEST = "test"
-        var running = false; private set
+        private val _state = MutableStateFlow(false)
+        /** true mientras el asistente está activo. La UI lo observa para actualizarse sola. */
+        val state: StateFlow<Boolean> = _state.asStateFlow()
+        val running: Boolean get() = _state.value
 
         fun intent(c: Context, action: String? = null) =
             Intent(c, DrivingService::class.java).also { if (action != null) it.action = action }
@@ -60,7 +66,7 @@ class DrivingService : Service() {
             askToReopen(this)
             stopSelf(); return
         }
-        running = true
+        _state.value = true
         Prefs.wanted = true
         BtAudio.ensure(this)
         // dar tiempo a que el canal Bluetooth se conecte antes de abrir el micrófono
@@ -92,7 +98,7 @@ class DrivingService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
+        _state.value = false
         h.removeCallbacksAndMessages(null)
         Assistant.stop()
         BtAudio.release(this)

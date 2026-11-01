@@ -42,8 +42,8 @@ object Matcher {
             .maxByOrNull { it.second }?.first
 
     private val YES = setOf("si", "dale", "ok", "okay", "oka", "claro", "enviar", "envia", "envialo", "enviala",
-        "mandalo", "mandala", "manda", "mandar", "correcto", "afirmativo", "yes", "obvio", "responder", "bueno", "listo")
-    private val NO = setOf("no", "cancelar", "cancela", "cancelalo", "nada", "negativo", "despues", "nop", "nope")
+        "mandalo", "mandala", "manda", "mandar", "correcto", "afirmativo", "yes", "obvio", "responder", "bueno", "listo", "contestar", "respondo", "okey")
+    private val NO = setOf("no", "cancelar", "cancela", "cancelalo", "nada", "negativo", "despues", "nop", "nope", "seguir", "segui", "sigue", "siguiente", "paso", "luego", "deja")
 
     /** true = sí, false = no, null = no se entendió */
     fun isYes(s: String): Boolean? {

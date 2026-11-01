@@ -21,7 +21,7 @@ import java.net.URL
  * Primera vez: Android pide confirmar. Desde ahí (Android 12+), las siguientes son silenciosas.
  */
 object Updater {
-    const val REPO = "__GITHUB_REPO__"
+    const val REPO = "Bl4cksit0/wavoz"
     private const val TAG = "WaVoz"
     private const val CHECK_EVERY_MS = 6 * 3600_000L
     private val h = Handler(Looper.getMainLooper())

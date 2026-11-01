@@ -50,6 +50,8 @@ object Assistant : TextToSpeech.OnInitListener {
     private val pendingSpeak = mutableListOf<() -> Unit>()
     private val callbacks = HashMap<String, () -> Unit>()
     private var uttSeq = 0
+    private var ttsOnBt: Boolean? = null
+    private var ttsRate = -1f
     private var gen = 0
     private var recognizer: SpeechRecognizer? = null
     private var focusReq: AudioFocusRequest? = null
@@ -92,12 +94,23 @@ object Assistant : TextToSpeech.OnInitListener {
             val t = tts ?: return@post
             if (status != TextToSpeech.SUCCESS) { Log.e(TAG, "TTS init failed"); return@post }
             if (t.setLanguage(Locale.getDefault()) < 0) t.setLanguage(Locale("es", "ES"))
+            try {
+                val lang = t.voice?.locale?.language ?: "es"
+                val cur = t.voice
+                if (cur == null || cur.isNetworkConnectionRequired) {
+                    t.voices?.filter { it.locale.language == lang && !it.isNetworkConnectionRequired &&
+                        !it.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) }
+                        ?.sortedWith(compareBy({ it.locale.country != (cur?.locale?.country ?: Locale.getDefault().country) }, { -it.quality }))
+                        ?.firstOrNull()?.let { t.voice = it; Log.d(TAG, "voz offline: ${it.name}") }
+                }
+            } catch (e: Exception) { Log.w(TAG, "voices", e) }
             t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
                 override fun onDone(id: String?) { h.post { id?.let { callbacks.remove(it)?.invoke() } } }
                 @Deprecated("") override fun onError(id: String?) { onDone(id) }
                 override fun onError(id: String?, code: Int) { onDone(id) }
             })
+            ttsOnBt = null; ttsRate = -1f
             ttsReady = true
             pendingSpeak.toList().forEach { it() }; pendingSpeak.clear()
         }
@@ -148,14 +161,15 @@ object Assistant : TextToSpeech.OnInitListener {
     }
 
     private fun pump() {
-        val inc = queue.removeFirstOrNull() ?: run { goIdle(); return }
+        var inc = queue.removeFirstOrNull() ?: run { goIdle(); return }
+        // Juntar los mensajes del mismo chat que llegaron mientras tanto: se leen de una y se pregunta una sola vez.
+        queue.filter { it.chat == inc.chat }.forEach { more -> inc = Incoming(inc.chat, inc.isGroup, inc.lines + more.lines) }
+        queue.removeAll { it.chat == inc.chat }
         lastChat = inc.chat; lastIncoming = inc
         speak(compose(inc)) {
             val t = targetFor(inc.chat)
             if (Prefs.askReply && (t.reply != null || t.phone != null)) {
-                listen("¿Querés responder?") { ans ->
-                    if (ans != null && Matcher.isYes(ans) == true) replyTo(t) else pump()
-                }
+                askYesNo("¿Querés responder?") { yes -> if (yes == true) replyTo(t) else pump() }
             } else pump()
         }
     }
@@ -370,9 +384,23 @@ object Assistant : TextToSpeech.OnInitListener {
         val g = gen
         val id = "u${uttSeq++}"
         callbacks[id] = { if (g == gen) then() }
-        t.setAudioAttributes(attrs())
-        t.setSpeechRate(Prefs.speechRate)
+        val bt = BtAudio.active
+        if (bt != ttsOnBt) { t.setAudioAttributes(attrs()); ttsOnBt = bt }
+        if (Prefs.speechRate != ttsRate) { t.setSpeechRate(Prefs.speechRate); ttsRate = Prefs.speechRate }
         t.speak(text, TextToSpeech.QUEUE_ADD, Bundle(), id)
+    }
+
+    /** Pregunta de sí/no con el reconocedor offline (rápido, entiende "sí"/"no"). Silencio = null. */
+    private fun askYesNo(prompt: String, cb: (Boolean?) -> Unit) {
+        speak(prompt) {
+            val g = gen
+            beep()
+            h.postDelayed({
+                if (g != gen) return@postDelayed
+                val ok = WakeListener.askYesNo(6000) { ans -> if (g == gen) cb(ans) }
+                if (!ok) recognize(beep = false) { heard -> cb(heard?.let { Matcher.isYes(it) }) }
+            }, 200)
+        }
     }
 
     private fun listen(prompt: String, cb: (String?) -> Unit) {
@@ -438,6 +466,7 @@ object Assistant : TextToSpeech.OnInitListener {
         callbacks.clear(); pendingSpeak.clear()
         tts?.stop()
         recognizer?.destroy(); recognizer = null
+        WakeListener.cancelAsk()
         WaAccessibility.instance?.cancelJobs()
     }
 

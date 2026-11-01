@@ -9,8 +9,8 @@ android {
         applicationId = "com.bck.wavoz"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "3.2"
+        versionCode = 6
+        versionName = "3.3"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     signingConfigs {

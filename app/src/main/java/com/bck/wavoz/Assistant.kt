@@ -10,6 +10,7 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
@@ -21,6 +22,8 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import java.io.File
+import java.security.MessageDigest
 import java.util.Locale
 
 /** Mensaje entrante ya filtrado, listo para leer. */
@@ -49,6 +52,8 @@ object Assistant : TextToSpeech.OnInitListener {
     private var ttsReady = false
     private val pendingSpeak = mutableListOf<() -> Unit>()
     private val callbacks = HashMap<String, () -> Unit>()
+    /** Síntesis a archivo pendientes: invoke(true) = terminó bien, invoke(false) = error o cancelada. */
+    private val synthCallbacks = HashMap<String, (Boolean) -> Unit>()
     private var uttSeq = 0
     private var ttsOnBt: Boolean? = null
     private var ttsRate = -1f
@@ -74,6 +79,7 @@ object Assistant : TextToSpeech.OnInitListener {
         app = c.applicationContext
         Prefs.init(app)
         if (tts == null) tts = TextToSpeech(app, this)
+        trimTtsCache()
         running = true
         WaContacts.load(app)
         WakeListener.onCommand = { cmd -> h.post { onWake(cmd) } }
@@ -108,9 +114,16 @@ object Assistant : TextToSpeech.OnInitListener {
             } catch (e: Exception) { Log.w(TAG, "voices", e) }
             t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
-                override fun onDone(id: String?) { h.post { id?.let { callbacks.remove(it)?.invoke() } } }
-                @Deprecated("") override fun onError(id: String?) { onDone(id) }
-                override fun onError(id: String?, code: Int) { onDone(id) }
+                override fun onDone(id: String?) { finish(id, true) }
+                @Deprecated("") override fun onError(id: String?) { finish(id, false) }
+                override fun onError(id: String?, code: Int) { finish(id, false) }
+                private fun finish(id: String?, ok: Boolean) {
+                    h.post {
+                        if (id == null) return@post
+                        callbacks.remove(id)?.let { it(); return@post }
+                        synthCallbacks.remove(id)?.invoke(ok)
+                    }
+                }
             })
             ttsOnBt = null; ttsRate = -1f
             ttsReady = true
@@ -383,17 +396,129 @@ object Assistant : TextToSpeech.OnInitListener {
 
     private fun say(text: String) = speak(text) { pump() }
 
+    /**
+     * Habla y después llama a then.
+     *
+     * El audio se genera ANTES de reproducirlo (synthesizeToFile) y se reproduce desde archivo: con el
+     * teléfono cargado, la síntesis en tiempo real no llega a tiempo y la voz se entrecorta.
+     * Los textos largos se parten en frases: mientras suena una se prepara la siguiente.
+     * Las frases repetidas ("¿Querés responder?", "Dictá el mensaje"…) quedan guardadas y salen al instante.
+     */
     private fun speak(text: String, then: () -> Unit) {
         val t = tts ?: return
         if (!ttsReady) { pendingSpeak.add { speak(text, then) }; return }
         requestFocus()
-        val g = gen
+        if (Prefs.speechRate != ttsRate) { t.setSpeechRate(Prefs.speechRate); ttsRate = Prefs.speechRate }
+        val parts = chunks(text)
+        if (parts.isEmpty()) { then(); return }
+        playParts(parts, 0, gen, then)
+    }
+
+    private fun playParts(parts: List<String>, i: Int, g: Int, then: () -> Unit) {
+        synth(parts[i]) { f ->
+            if (g != gen) return@synth
+            if (i + 1 < parts.size) synth(parts[i + 1]) {}      // preparar la siguiente mientras suena esta
+            val next = { if (i + 1 < parts.size) playParts(parts, i + 1, g, then) else then() }
+            if (f != null) play(f, g, next) else speakDirect(parts[i], g, next)
+        }
+    }
+
+    /** Parte el texto en frases: la primera sola (para empezar rápido), el resto en bloques de ~250 letras. */
+    private fun chunks(text: String): List<String> {
+        val sentences = text.split(Regex("(?<=[.!?:])\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+        if (sentences.size <= 1) return sentences
+        val out = mutableListOf(sentences[0])
+        val sb = StringBuilder()
+        for (s in sentences.drop(1)) {
+            if (sb.isNotEmpty() && sb.length + s.length > 250) { out += sb.toString(); sb.clear() }
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(s)
+        }
+        if (sb.isNotEmpty()) out += sb.toString()
+        return out
+    }
+
+    // ---- caché de audio sintetizado
+    private val ttsDir by lazy { File(app.cacheDir, "tts").apply { mkdirs() } }
+    private val inFlight = HashMap<String, MutableList<(File?) -> Unit>>()
+    private var player: MediaPlayer? = null
+
+    private fun keyFor(text: String): String {
+        val raw = "${tts?.voice?.name}|$ttsRate|$text"
+        return MessageDigest.getInstance("SHA-1").digest(raw.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+
+    /** Devuelve (en el hilo principal) el archivo con el audio de text, o null si no se pudo generar. */
+    private fun synth(text: String, cb: (File?) -> Unit) {
+        val t = tts ?: run { cb(null); return }
+        val key = keyFor(text)
+        val f = File(ttsDir, "$key.wav")
+        if (f.length() > 44) { f.setLastModified(System.currentTimeMillis()); cb(f); return }
+        inFlight[key]?.let { it += cb; return }      // ya se está generando
+        inFlight[key] = mutableListOf(cb)
+        val tmp = File(ttsDir, "$key.tmp")
+        val id = "f${uttSeq++}"
+        fun done(success: Boolean) {
+            // Solo se guarda si la síntesis terminó bien: un audio cortado no debe quedar en la caché.
+            val ok = success && tmp.length() > 44 && tmp.renameTo(f)
+            if (!ok) tmp.delete()
+            inFlight.remove(key)?.forEach { it(if (ok) f else null) }
+        }
+        synthCallbacks[id] = { ok -> done(ok) }
+        val r = try { t.synthesizeToFile(text, Bundle(), tmp, id) } catch (e: Exception) { TextToSpeech.ERROR }
+        if (r != TextToSpeech.SUCCESS) { synthCallbacks.remove(id); done(false) }
+    }
+
+    private fun play(f: File, g: Int, done: () -> Unit) {
+        stopPlayer()
+        val mp = MediaPlayer()
+        player = mp
+        var finished = false
+        fun end() {
+            if (finished) return
+            finished = true
+            if (player === mp) player = null
+            try { mp.release() } catch (_: Exception) {}
+            if (g == gen) done()
+        }
+        try {
+            mp.setAudioAttributes(attrs())
+            mp.setDataSource(f.path)
+            mp.setOnCompletionListener { end() }
+            mp.setOnErrorListener { _, _, _ -> end(); true }
+            mp.prepare()          // archivo local: es inmediato
+            mp.start()
+        } catch (e: Exception) {
+            Log.w(TAG, "play", e); end()
+        }
+    }
+
+    private fun stopPlayer() {
+        val p = player ?: return
+        player = null
+        try { p.stop() } catch (_: Exception) {}
+        try { p.release() } catch (_: Exception) {}
+    }
+
+    /** Plan B: síntesis en tiempo real (como antes). */
+    private fun speakDirect(text: String, g: Int, then: () -> Unit) {
+        val t = tts ?: return
         val id = "u${uttSeq++}"
         callbacks[id] = { if (g == gen) then() }
         val bt = BtAudio.active
         if (bt != ttsOnBt) { t.setAudioAttributes(attrs()); ttsOnBt = bt }
-        if (Prefs.speechRate != ttsRate) { t.setSpeechRate(Prefs.speechRate); ttsRate = Prefs.speechRate }
         t.speak(text, TextToSpeech.QUEUE_ADD, Bundle(), id)
+    }
+
+    /** Deja como mucho 60 audios guardados (los más usados recientemente). */
+    private fun trimTtsCache() {
+        Thread {
+            try {
+                val files = ttsDir.listFiles()?.sortedByDescending { it.lastModified() } ?: return@Thread
+                files.filter { it.name.endsWith(".tmp") }.forEach { it.delete() }
+                files.filter { it.name.endsWith(".wav") }.drop(60).forEach { it.delete() }
+            } catch (_: Exception) {}
+        }.start()
     }
 
     /** Pregunta de sí/no con el reconocedor offline (rápido, entiende "sí"/"no"). Silencio = null. */
@@ -486,6 +611,9 @@ object Assistant : TextToSpeech.OnInitListener {
         gen++
         callbacks.clear(); pendingSpeak.clear()
         tts?.stop()
+        stopPlayer()
+        // tts.stop() cancela las síntesis pendientes sin avisar: liberar las esperas.
+        synthCallbacks.values.toList().forEach { it(false) }; synthCallbacks.clear()
         recSession++
         try { recognizer?.cancel() } catch (_: Exception) {}
         WakeListener.cancelAsk()

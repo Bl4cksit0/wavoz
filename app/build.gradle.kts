@@ -9,8 +9,8 @@ android {
         applicationId = "com.bck.wavoz"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "4.1"
+        versionCode = 9
+        versionName = "4.2"
         // Solo 32 bits: el Galaxy A13 (SM-A135M) corre Android de 32 bits y no puede usar arm64-v8a.
         // Los celulares de 64 bits con soporte de 32 también la ejecutan.
         ndk { abiFilters += listOf("armeabi-v7a") }

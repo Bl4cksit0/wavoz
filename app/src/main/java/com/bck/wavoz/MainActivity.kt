@@ -42,7 +42,8 @@ class MainActivity : Activity() {
             startForegroundService(DrivingService.intent(this))
             root.postDelayed({ build() }, 600)
         }
-        Updater.check(this, force = false)
+        // Al abrir la app se busca actualización siempre (máximo una vez por minuto).
+        Updater.check(this, force = false, every = 60_000L)
         build()
     }
 

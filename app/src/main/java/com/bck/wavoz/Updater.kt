@@ -42,11 +42,11 @@ object Updater {
     }
 
     /** force = ignorar el intervalo (botón "Buscar actualización"). onDone corre en el hilo principal. */
-    fun check(c: Context, force: Boolean, onDone: ((String) -> Unit)? = null) {
+    fun check(c: Context, force: Boolean, every: Long = CHECK_EVERY_MS, onDone: ((String) -> Unit)? = null) {
         val app = c.applicationContext
         Prefs.init(app)
         if (working) return
-        if (!force && (!Prefs.autoUpdate || System.currentTimeMillis() - Prefs.lastUpdateCheck < CHECK_EVERY_MS)) return
+        if (!force && (!Prefs.autoUpdate || System.currentTimeMillis() - Prefs.lastUpdateCheck < every)) return
         working = true
         Thread {
             val msg = try {

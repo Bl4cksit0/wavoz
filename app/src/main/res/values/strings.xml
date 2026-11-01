@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">WaVoz</string>
+    <string name="acc_label">WaVoz – manejar WhatsApp por voz</string>
+    <string name="acc_desc">Permite que WaVoz abra el chat de WhatsApp, escriba el mensaje que dictás y toque Enviar cuando decís \"enviar\". Solo actúa cuando vos se lo pedís por voz.</string>
+</resources>

@@ -44,6 +44,7 @@ data class Target(val name: String, val reply: ReplyTarget?, val phone: String?,
 object Assistant : TextToSpeech.OnInitListener {
     private const val TAG = "WaVoz"
     private const val SILENCE_MS = 5000L
+    private const val RECOGNITION_LANG = "es-AR"
     val WA_PKGS = listOf("com.whatsapp", "com.whatsapp.w4b")
 
     private lateinit var app: Context
@@ -591,7 +592,10 @@ object Assistant : TextToSpeech.OnInitListener {
         })
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+            // Español rioplatense: entiende mejor "vos", "querés" y la pronunciación de acá
+            // (el celular está en es-US). Si el reconocedor no tiene es-AR, usa español general.
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, RECOGNITION_LANG)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, RECOGNITION_LANG)
             .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
         try { r.startListening(i) } catch (e: Exception) { dropRecognizer(); finish(null) }

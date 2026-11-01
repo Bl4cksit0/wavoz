@@ -36,13 +36,12 @@ object ScreenWaker {
         wl?.let { if (it.isHeld) it.release() }
         wl = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "wavoz:wake")
             .also { it.acquire(90_000) }
-        UnlockActivity.pending = cb
+        // El seguro de 6 s queda atado a ESTE pedido: se cancela al terminar y no puede cerrar uno nuevo.
+        UnlockActivity.arm(cb) { screenReady(c) }
         val i = Intent(c, UnlockActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
         val starter: Context = WaAccessibility.instance ?: c
         try { starter.startActivity(i) } catch (_: Exception) { UnlockActivity.finishPending(false) }
-        // seguro por si no llega respuesta
-        Handler(Looper.getMainLooper()).postDelayed({ UnlockActivity.finishPending(screenReady(c)) }, 6000)
     }
 
     /** Si la pantalla la prendimos nosotros, la apaga de nuevo (bloquea). */
@@ -59,8 +58,25 @@ object ScreenWaker {
 /** Actividad invisible que se muestra sobre la pantalla de bloqueo y pide quitarla. */
 class UnlockActivity : Activity() {
     companion object {
-        var pending: ((Boolean) -> Unit)? = null
-        fun finishPending(ok: Boolean) { val p = pending; pending = null; p?.invoke(ok) }
+        private const val TIMEOUT_MS = 6000L
+        private val h = Handler(Looper.getMainLooper())
+        private var pending: ((Boolean) -> Unit)? = null
+        private var timeout: Runnable? = null
+
+        /** Registra el callback del pedido actual con su propio seguro de tiempo. */
+        fun arm(cb: (Boolean) -> Unit, readyNow: () -> Boolean) {
+            timeout?.let { h.removeCallbacks(it) }
+            pending?.invoke(false)          // un pedido anterior que quedó colgado
+            pending = cb
+            val t = Runnable { if (pending === cb) finishPending(readyNow()) }
+            timeout = t
+            h.postDelayed(t, TIMEOUT_MS)
+        }
+
+        fun finishPending(ok: Boolean) {
+            timeout?.let { h.removeCallbacks(it) }; timeout = null
+            val p = pending; pending = null; p?.invoke(ok)
+        }
     }
 
     override fun onCreate(b: Bundle?) {
@@ -79,6 +95,6 @@ class UnlockActivity : Activity() {
     private fun done(ok: Boolean) {
         finish()
         overridePendingTransition(0, 0)
-        Handler(Looper.getMainLooper()).postDelayed({ finishPending(ok) }, 400)
+        h.post { finishPending(ok) }
     }
 }

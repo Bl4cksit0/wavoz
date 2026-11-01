@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -32,7 +33,50 @@ class WaAccessibility : AccessibilityService() {
     override fun onDestroy() { instance = null; super.onDestroy() }
     override fun onUnbind(intent: Intent?): Boolean { instance = null; return super.onUnbind(intent) }
     override fun onInterrupt() {}
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    // ---------------------------------------------------------------- espera guiada por eventos
+    /** Paso a revisar con cada cambio de WhatsApp; devuelve true cuando terminó. */
+    private var waiter: (() -> Boolean)? = null
+    private var checkPosted = false
+    private var lastAction = 0L
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        if (waiter == null || checkPosted) return
+        if (e?.packageName?.toString() !in Assistant.WA_PKGS) return
+        // Agrupar ráfagas de eventos: como mucho una revisión cada 50 ms.
+        checkPosted = true
+        h.postDelayed({ checkPosted = false; runWaiter() }, 50)
+    }
+
+    private fun runWaiter() {
+        val w = waiter ?: return
+        if (w()) waiter = null
+    }
+
+    /**
+     * Ejecuta step cada vez que WhatsApp cambia (y cada 700 ms por las dudas) hasta que devuelva true.
+     * Si vence el tiempo, llama a onTimeout.
+     */
+    private fun waitFor(timeoutMs: Long, onTimeout: () -> Unit, step: () -> Boolean) {
+        val j = ++job
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        lastAction = 0L
+        waiter = { j != job || step() }
+        fun tick() {
+            if (j != job || waiter == null) return
+            if (SystemClock.uptimeMillis() > deadline) { waiter = null; onTimeout(); return }
+            runWaiter()
+            if (waiter != null) h.postDelayed({ tick() }, 700)
+        }
+        h.post { tick() }
+    }
+
+    /** Evita repetir una acción (tocar buscar, etc.) antes de que WhatsApp reaccione a la anterior. */
+    private fun canAct(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastAction < 400) return false
+        lastAction = now
+        return true
+    }
 
     private fun waRoot(): AccessibilityNodeInfo? {
         val r = rootInActiveWindow ?: return null
@@ -82,16 +126,10 @@ class WaAccessibility : AccessibilityService() {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (pkg != null) i.setPackage(pkg)
         try { startActivity(i) } catch (e: Exception) { Log.w(TAG, "open", e); cb(false); return }
-        val j = ++job
-        var tries = 0
-        fun poll() {
-            if (j != job) return
+        waitFor(10_000, onTimeout = { cb(false) }) {
             val r = waRoot()
-            if (r != null && findEntry(r) != null) { cb(true); return }
-            if (++tries > 25) { cb(false); return }
-            h.postDelayed({ poll() }, 400)
+            if (r != null && findEntry(r) != null) { cb(true); true } else false
         }
-        h.postDelayed({ poll() }, 800)
     }
 
     /** Abre WhatsApp, usa la búsqueda y entra al chat (sirve para grupos). Mejor esfuerzo. */
@@ -101,20 +139,17 @@ class WaAccessibility : AccessibilityService() {
         val launch = packageManager.getLaunchIntentForPackage(pkg)!!
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         try { startActivity(launch) } catch (_: Exception) { cb(false); return }
-        val j = ++job
-        var step = 0; var tries = 0
+        var step = 0
         val target = Matcher.norm(name)
-        fun poll() {
-            if (j != job) return
-            if (++tries > 30) { cb(false); return }
-            val r = waRoot()
-            if (r != null) when (step) {
+        waitFor(15_000, onTimeout = { cb(false) }) wait@{
+            val r = waRoot() ?: return@wait false
+            when (step) {
                 0 -> {
-                    if (findEntry(r) != null) { performGlobalAction(GLOBAL_ACTION_BACK) }
+                    if (findEntry(r) != null) { if (canAct()) performGlobalAction(GLOBAL_ACTION_BACK) }
                     else {
                         val edits = mutableListOf<AccessibilityNodeInfo>(); findAll(r, edits) { it.isEditable }
                         if (edits.isNotEmpty()) { setText(edits[0], name); step = 1 }
-                        else {
+                        else if (canAct()) {
                             val ids = listOf("menuitem_search", "my_search_bar", "search_bar", "search_icon")
                             val byId = ids.firstNotNullOfOrNull { id -> r.findAccessibilityNodeInfosByViewId("$pkg:id/$id").firstOrNull() }
                             val btn = byId ?: mutableListOf<AccessibilityNodeInfo>().also { l ->
@@ -126,17 +161,17 @@ class WaAccessibility : AccessibilityService() {
                             btn?.let { clickable(it).performAction(AccessibilityNodeInfo.ACTION_CLICK) }
                         }
                     }
+                    false
                 }
                 1 -> {
                     val hits = mutableListOf<AccessibilityNodeInfo>()
                     findAll(r, hits) { n -> !n.isEditable && n.text != null && Matcher.norm(n.text.toString()) == target }
-                    hits.firstOrNull()?.let { clickable(it).performAction(AccessibilityNodeInfo.ACTION_CLICK); step = 2 }
+                    hits.firstOrNull()?.let { if (canAct()) { clickable(it).performAction(AccessibilityNodeInfo.ACTION_CLICK); step = 2 } }
+                    false
                 }
-                2 -> if (findEntry(r) != null) { cb(true); return }
+                else -> if (findEntry(r) != null) { cb(true); true } else false
             }
-            h.postDelayed({ poll() }, 500)
         }
-        h.postDelayed({ poll() }, 1000)
     }
 
     private fun setText(n: AccessibilityNodeInfo, text: String): Boolean {
@@ -168,8 +203,8 @@ class WaAccessibility : AccessibilityService() {
             if (++tries > 6) { cb(false); return }
             h.postDelayed({ tryClick() }, 300)
         }
-        h.postDelayed({ tryClick() }, 300)
+        tryClick()   // el botón Enviar suele estar listo enseguida; si no, reintenta cada 300 ms
     }
 
-    fun cancelJobs() { job++ }
+    fun cancelJobs() { job++; waiter = null }
 }

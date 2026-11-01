@@ -9,6 +9,8 @@ Asistente de voz manos libres para WhatsApp (pensado para usar con intercom de c
 
 ## Compilar
 ```
-./get-model.sh
 gradle assembleRelease
 ```
+
+El modelo de voz offline (Vosk, español, ~40 MB) no va dentro de la APK: la app lo descarga
+la primera vez (por Wi-Fi, o por datos si lo pedís en Ajustes) y lo guarda en el teléfono.

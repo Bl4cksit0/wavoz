@@ -47,6 +47,8 @@ object Updater {
         Prefs.init(app)
         if (working) return
         if (!force && (!Prefs.autoUpdate || System.currentTimeMillis() - Prefs.lastUpdateCheck < every)) return
+        // Las automáticas solo por Wi-Fi (o red sin límite de datos); el botón "Buscar ahora" usa cualquier red.
+        if (!force && (try { app.getSystemService(android.net.ConnectivityManager::class.java).isActiveNetworkMetered } catch (_: Exception) { true })) return
         working = true
         Thread {
             val msg = try {

@@ -6,41 +6,42 @@ import android.os.Looper
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import org.vosk.LibVosk
-import org.vosk.LogLevel
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
 
 /**
- * Escucha continua y offline (Vosk) de comandos cortos: "escribir", "responder", "repetir".
- * Se pausa mientras el asistente habla o usa el reconocimiento de Google.
+ * Escucha continua y offline (Vosk) de comandos cortos: "escribir", "responder", "repetir",
+ * y preguntas de sí/no. Se pausa mientras el asistente habla o usa el reconocimiento de Google.
+ *
+ * Los Recognizer se crean una sola vez y se reutilizan con reset(); el micrófono (SpeechService)
+ * sí se abre y cierra en cada pausa para seguir la ruta de audio (casco / teléfono).
  */
 object WakeListener : RecognitionListener {
     private const val TAG = "WaVoz"
     private val h = Handler(Looper.getMainLooper())
     private var model: Model? = null
-    private var loading = false
     private var service: SpeechService? = null
-    private var rec: Recognizer? = null
+    private var wakeRec: Recognizer? = null
     private var wanted = false
     var onCommand: ((String) -> Unit)? = null
-    var ready = false; private set
+    val ready: Boolean get() = model != null
 
     private val WRITE = setOf("escribir", "escribe", "mensaje")
     private val REPLY = setOf("responder", "contestar")
     private val REPEAT = setOf("repetir", "repite")
     private val GRAMMAR = (WRITE + REPLY + REPEAT).toList() + "[unk]"
 
+    // Comando visto en el parcial anterior: si se repite en el siguiente, se acepta sin esperar el final.
+    private var lastPartial: String? = null
+    private var fired = false
+
     fun init(c: Context) {
-        if (model != null || loading) return
-        loading = true
-        LibVosk.setLogLevel(LogLevel.WARNINGS)
-        StorageService.unpack(c.applicationContext, "model-es", "model",
-            { m -> model = m; loading = false; ready = true; if (wanted) startInternal() },
-            { e -> loading = false; Log.e(TAG, "model unpack", e) })
+        VoskModel.ensure(c) { m ->
+            model = m
+            if (wanted && service == null) startInternal()
+        }
     }
 
     fun resume() {
@@ -54,17 +55,22 @@ object WakeListener : RecognitionListener {
         stopInternal()
     }
 
-    fun restart() { if (wanted) { stopInternal(); h.postDelayed({ if (wanted && service == null) startInternal() }, 500) } }
+    fun restart() { if (wanted) { stopInternal(); h.postDelayed({ if (wanted && service == null) startInternal() }, 300) } }
+
+    private fun wakeRecognizer(m: Model): Recognizer =
+        wakeRec ?: Recognizer(m, 16000f, JSONArray(GRAMMAR).toString()).also { it.setWords(true); wakeRec = it }
 
     private fun startInternal() {
         val m = model ?: return
+        if (askSvc != null) return
         try {
-            val r = Recognizer(m, 16000f, JSONArray(GRAMMAR).toString())
-            r.setWords(true)
-            rec = r
+            val r = wakeRecognizer(m)
+            r.reset()
+            lastPartial = null; fired = false
             val s = SpeechService(r, 16000f)
             service = s
             s.startListening(this)
+            Log.d(TAG, "escuchando comandos")
         } catch (e: Exception) {
             Log.w(TAG, "vosk start", e); stopInternal()
             h.postDelayed({ if (wanted && service == null) startInternal() }, 3000)
@@ -74,26 +80,49 @@ object WakeListener : RecognitionListener {
     private fun stopInternal() {
         try { service?.stop(); service?.shutdown() } catch (_: Exception) {}
         service = null
-        try { rec?.close() } catch (_: Exception) {}
-        rec = null
     }
 
-    private fun handle(hyp: String?) {
+    private fun cmdFor(word: String) = when (word) {
+        in WRITE -> "write"; in REPLY -> "reply"; in REPEAT -> "repeat"; else -> null
+    }
+
+    private fun fire(cmd: String, why: String) {
+        if (fired || !wanted) return
+        fired = true
+        Log.d(TAG, "wake: $cmd ($why)")
+        onCommand?.invoke(cmd)
+    }
+
+    private fun handleFinal(hyp: String?) {
+        lastPartial = null
         if (hyp == null || !wanted) return
+        if (fired) { fired = false; return }   // ya se disparó con los parciales de esta frase
         val o = try { JSONObject(hyp) } catch (_: Exception) { return }
         val words = o.optJSONArray("result") ?: return
         for (i in 0 until words.length()) {
             val w = words.getJSONObject(i)
-            val word = w.optString("word"); val conf = w.optDouble("conf", 0.0)
-            if (conf < 0.75) continue
-            val cmd = when (word) {
-                in WRITE -> "write"; in REPLY -> "reply"; in REPEAT -> "repeat"; else -> null
-            } ?: continue
-            Log.d(TAG, "wake: $word ($conf)")
-            onCommand?.invoke(cmd)
+            if (w.optDouble("conf", 0.0) < 0.75) continue
+            val cmd = cmdFor(w.optString("word")) ?: continue
+            fire(cmd, "final"); fired = false
             return
         }
     }
+
+    private fun handlePartial(hyp: String?) {
+        if (hyp == null || !wanted || fired) return
+        val text = try { JSONObject(hyp).optString("partial") } catch (_: Exception) { return }
+        val cmd = text.split(" ").firstNotNullOfOrNull { cmdFor(it) }
+        if (cmd != null && cmd == lastPartial) fire(cmd, "parcial") else lastPartial = cmd
+    }
+
+    override fun onResult(hypothesis: String?) = handleFinal(hypothesis)
+    override fun onFinalResult(hypothesis: String?) = handleFinal(hypothesis)
+    override fun onPartialResult(hypothesis: String?) = handlePartial(hypothesis)
+    override fun onError(e: Exception?) {
+        Log.w(TAG, "vosk error", e); stopInternal()
+        h.postDelayed({ if (wanted && service == null) startInternal() }, 2000)
+    }
+    override fun onTimeout() { stopInternal(); if (wanted) startInternal() }
 
     // ------------------------------------------------------------- pregunta corta (sí / no)
     private val YES_W = listOf("sí", "si", "dale", "responder", "contestar", "claro", "bueno", "okey", "listo", "respondo")
@@ -102,6 +131,9 @@ object WakeListener : RecognitionListener {
     private var askRec: Recognizer? = null
     private var askCb: ((Boolean?) -> Unit)? = null
     private var askGen = 0
+
+    private fun askRecognizer(m: Model): Recognizer =
+        askRec ?: Recognizer(m, 16000f, JSONArray(YES_W + NO_W + "[unk]").toString()).also { it.setWords(true); askRec = it }
 
     /**
      * Escucha offline una respuesta corta. cb(true)=sí, cb(false)=no, cb(null)=no se entendió / silencio.
@@ -112,9 +144,8 @@ object WakeListener : RecognitionListener {
         stopInternal(); cancelAsk()
         val g = ++askGen
         return try {
-            val r = Recognizer(m, 16000f, JSONArray(YES_W + NO_W + "[unk]").toString())
-            r.setWords(true)
-            askRec = r
+            val r = askRecognizer(m)
+            r.reset()
             askCb = cb
             val s = SpeechService(r, 16000f)
             askSvc = s
@@ -128,7 +159,7 @@ object WakeListener : RecognitionListener {
                     }
                     for (w in words) {
                         val ans = when (w) { in YES_W -> true; in NO_W -> false; else -> null } ?: continue
-                        // Con parciales solo aceptamos palabras de 2+ sílabas o el "no"/"sí" ya cerrado.
+                        // Con parciales solo aceptamos palabras de 4+ letras; "sí"/"no" esperan el resultado.
                         if (partial && w.length < 4) continue
                         Log.d(TAG, "yes/no: $w")
                         h.post { finishAsk(g, ans) }
@@ -160,16 +191,5 @@ object WakeListener : RecognitionListener {
         askCb = null
         try { askSvc?.stop(); askSvc?.shutdown() } catch (_: Exception) {}
         askSvc = null
-        try { askRec?.close() } catch (_: Exception) {}
-        askRec = null
     }
-
-    override fun onResult(hypothesis: String?) = handle(hypothesis)
-    override fun onFinalResult(hypothesis: String?) = handle(hypothesis)
-    override fun onPartialResult(hypothesis: String?) {}
-    override fun onError(e: Exception?) {
-        Log.w(TAG, "vosk error", e); stopInternal()
-        h.postDelayed({ if (wanted && service == null) startInternal() }, 2000)
-    }
-    override fun onTimeout() { stopInternal(); if (wanted) startInternal() }
 }

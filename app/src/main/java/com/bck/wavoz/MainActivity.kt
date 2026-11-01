@@ -101,6 +101,7 @@ class MainActivity : ComponentActivity() {
         }
         // Al abrir la app se busca actualización siempre (máximo una vez por minuto).
         Updater.check(this, force = false, every = 60_000L) { refresh() }
+        VoskModel.refreshState(this)
         refresh()
     }
 

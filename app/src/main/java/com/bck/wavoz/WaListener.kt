@@ -48,7 +48,7 @@ class WaListener : NotificationListenerService() {
         if (!announce || fresh.isEmpty()) return
 
         val toRead = if (Prefs.readAll) fresh else {
-            val rule = Prefs.rules()[p.chat] ?: return
+            val rule = Prefs.rule(p.chat) ?: return
             if (p.isGroup && rule.members.isNotEmpty()) {
                 val allowed = rule.members.map { Matcher.norm(it) }.toSet()
                 fresh.filter { Matcher.norm(it.sender) in allowed }

@@ -59,7 +59,8 @@ object Assistant : TextToSpeech.OnInitListener {
     private val recentlySent = ArrayDeque<String>()
 
     var running = false; private set
-    var busy = false; private set
+    /** Lo lee también el hilo del Updater (no actualizar en medio de un dictado). */
+    @Volatile var busy = false; private set
     var lastChat: String? = null; private set
     private var lastIncoming: Incoming? = null
 
@@ -86,6 +87,7 @@ object Assistant : TextToSpeech.OnInitListener {
         queue.clear()
         WakeListener.pause()
         tts?.shutdown(); tts = null; ttsReady = false
+        dropRecognizer()
         busy = false
     }
 
@@ -157,6 +159,8 @@ object Assistant : TextToSpeech.OnInitListener {
     private fun goIdle() {
         busy = false
         abandonFocus()
+        // Si el casco se conectó/desconectó mientras estaba ocupado, reenrutar ahora.
+        if (running) BtAudio.ensure(app)
         if (running && Prefs.wakeWord) WakeListener.resume()
     }
 
@@ -239,6 +243,7 @@ object Assistant : TextToSpeech.OnInitListener {
 
     /** Junta frases hasta que haya 5 s de silencio. */
     private fun collect(d: Draft, lastSpeech: Long, first: Boolean = false) {
+        val t0 = SystemClock.elapsedRealtime()
         recognize(beep = first) { r ->
             val now = SystemClock.elapsedRealtime()
             if (r != null) {
@@ -257,7 +262,9 @@ object Assistant : TextToSpeech.OnInitListener {
                 when {
                     d.text.isBlank() && now - lastSpeech > 15000 -> cancelDraft(d, "No escuché ningún mensaje. Cancelado.")
                     d.text.isNotBlank() && now - lastSpeech >= SILENCE_MS -> askReady(d, 0)
-                    else -> h.postDelayed({ collect(d, lastSpeech) }, 200)
+                    // Seguir escuchando enseguida; solo si el reconocedor falló al instante, esperar un poco.
+                    now - t0 < 300 -> h.postDelayed({ collect(d, lastSpeech) }, 300)
+                    else -> h.post { collect(d, lastSpeech) }
                 }
             }
         }
@@ -302,7 +309,7 @@ object Assistant : TextToSpeech.OnInitListener {
 
     /** Sale de WhatsApp: vuelve a la app anterior o, si prendimos la pantalla, la apaga. */
     private fun leaveChat(acc: WaAccessibility) {
-        if (ScreenWaker.wokeByUs) { acc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME); h.postDelayed({ ScreenWaker.restore() }, 600) }
+        if (ScreenWaker.wokeByUs) { acc.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME); h.postDelayed({ ScreenWaker.restore() }, 300) }
         else { acc.returnToPrevious(); ScreenWaker.restore() }
     }
 
@@ -328,8 +335,7 @@ object Assistant : TextToSpeech.OnInitListener {
     }
 
     fun targetFor(chat: String): Target {
-        val seen = Prefs.seen()[chat]
-        return Target(chat, replies[chat], phoneFor(chat), seen?.isGroup ?: false)
+        return Target(chat, replies[chat], phoneFor(chat), Prefs.isGroupChat(chat) ?: false)
     }
 
     private fun resolve(q: String): Pair<Target, Double>? {
@@ -399,7 +405,7 @@ object Assistant : TextToSpeech.OnInitListener {
                 if (g != gen) return@postDelayed
                 val ok = WakeListener.askYesNo(6000) { ans -> if (g == gen) cb(ans) }
                 if (!ok) recognize(beep = false) { heard -> cb(heard?.let { Matcher.isYes(it) }) }
-            }, 200)
+            }, 120)
         }
     }
 
@@ -416,25 +422,40 @@ object Assistant : TextToSpeech.OnInitListener {
         }
         val g = gen
         if (beep) beep()
-        h.postDelayed({ if (g == gen) startRecognizer(g, cb) }, if (beep) 250 else 50)
+        h.postDelayed({ if (g == gen) startRecognizer(g, cb) }, if (beep) 120 else 0)
     }
 
+    /** Un solo SpeechRecognizer de Google: crearlo/destruirlo en cada vuelta cuesta ~150-300 ms. */
+    private fun googleRecognizer(): SpeechRecognizer =
+        recognizer ?: SpeechRecognizer.createSpeechRecognizer(app).also { recognizer = it }
+
+    private fun dropRecognizer() {
+        try { recognizer?.destroy() } catch (_: Exception) {}
+        recognizer = null
+    }
+
+    private var recSession = 0
+
     private fun startRecognizer(g: Int, cb: (String?) -> Unit) {
-        recognizer?.destroy()
-        val r = SpeechRecognizer.createSpeechRecognizer(app)
-        recognizer = r
+        val r = googleRecognizer()
+        val session = ++recSession
         var done = false
         fun finish(text: String?) {
-            if (done) return
+            if (done || session != recSession) return
             done = true
-            if (recognizer === r) { r.destroy(); recognizer = null }
             if (g == gen) cb(text)
         }
         r.setRecognitionListener(object : RecognitionListener {
             override fun onResults(b: Bundle?) {
                 finish(b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.takeIf { it.isNotBlank() })
             }
-            override fun onError(error: Int) { Log.d(TAG, "rec error $error"); finish(null) }
+            override fun onError(error: Int) {
+                Log.d(TAG, "rec error $error")
+                // Si el servicio quedó en mal estado, se recrea en la próxima vuelta.
+                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT ||
+                    error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED) dropRecognizer()
+                finish(null)
+            }
             override fun onReadyForSpeech(p: Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(v: Float) {}
@@ -448,16 +469,16 @@ object Assistant : TextToSpeech.OnInitListener {
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
-        try { r.startListening(i) } catch (e: Exception) { finish(null) }
-        h.postDelayed({ finish(null) }, 20000)
+        try { r.startListening(i) } catch (e: Exception) { dropRecognizer(); finish(null) }
+        h.postDelayed({ if (!done && session == recSession) { try { r.cancel() } catch (_: Exception) {}; finish(null) } }, 20000)
     }
 
     private fun beep() {
         try {
             val stream = if (BtAudio.active) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
             val tg = ToneGenerator(stream, 80)
-            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
-            h.postDelayed({ tg.release() }, 400)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 100)
+            h.postDelayed({ tg.release() }, 300)
         } catch (_: Exception) {}
     }
 
@@ -465,7 +486,8 @@ object Assistant : TextToSpeech.OnInitListener {
         gen++
         callbacks.clear(); pendingSpeak.clear()
         tts?.stop()
-        recognizer?.destroy(); recognizer = null
+        recSession++
+        try { recognizer?.cancel() } catch (_: Exception) {}
         WakeListener.cancelAsk()
         WaAccessibility.instance?.cancelJobs()
     }

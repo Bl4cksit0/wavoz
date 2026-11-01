@@ -9,9 +9,11 @@ android {
         applicationId = "com.bck.wavoz"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "4.0"
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        versionCode = 8
+        versionName = "4.1"
+        // Solo 32 bits: el Galaxy A13 (SM-A135M) corre Android de 32 bits y no puede usar arm64-v8a.
+        // Los celulares de 64 bits con soporte de 32 también la ejecutan.
+        ndk { abiFilters += listOf("armeabi-v7a") }
     }
     signingConfigs {
         create("wavoz") {
@@ -21,7 +23,10 @@ android {
     }
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8: achica el código (sobre todo los íconos de Material). Reglas de Vosk/JNA en proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("wavoz")
         }
     }

@@ -4,6 +4,9 @@ import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -61,5 +64,25 @@ object BtAudio {
             am.mode = AudioManager.MODE_NORMAL
         } catch (_: Exception) {}
         active = false
+    }
+
+    /** true cuando el canal del casco ya está realmente conectado. */
+    @Suppress("DEPRECATION")
+    private fun linkUp(c: Context): Boolean {
+        val am = am(c)
+        return if (Build.VERSION.SDK_INT >= 31) am.communicationDevice?.type.let {
+            it == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it == AudioDeviceInfo.TYPE_BLE_HEADSET
+        } else am.isBluetoothScoOn
+    }
+
+    /** Llama a cb apenas el casco está listo (o enseguida si no se usa), con un máximo de 1,5 s. */
+    fun whenReady(c: Context, cb: () -> Unit) {
+        val h = Handler(Looper.getMainLooper())
+        val start = SystemClock.uptimeMillis()
+        fun check() {
+            if (!active || linkUp(c) || SystemClock.uptimeMillis() - start > 1500) cb()
+            else h.postDelayed({ check() }, 100)
+        }
+        check()
     }
 }

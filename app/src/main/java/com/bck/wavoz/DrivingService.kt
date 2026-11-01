@@ -8,6 +8,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -68,21 +71,42 @@ class DrivingService : Service() {
         }
         _state.value = true
         Prefs.wanted = true
+        // El modelo de voz se carga en paralelo mientras se conecta el casco.
+        VoskModel.ensure(this)
         BtAudio.ensure(this)
-        // dar tiempo a que el canal Bluetooth se conecte antes de abrir el micrófono
-        h.postDelayed({ if (running) Assistant.start(this) }, 1200)
-        h.postDelayed(watchdog, 10000)
+        BtAudio.whenReady(this) { if (running) Assistant.start(this) }
+        // Avisa cuando se conecta/desconecta el casco (antes se revisaba cada 10 s).
+        getSystemService(AudioManager::class.java).registerAudioDeviceCallback(deviceCb, h)
+        h.postDelayed(periodic, PERIODIC_MS)
     }
 
     private val h = android.os.Handler(android.os.Looper.getMainLooper())
 
-    /** Cada 10 s: si se conectó/desconectó el casco, reenruta el audio. */
-    private val watchdog = object : Runnable {
+    private val routeCheck = Runnable {
+        // Si está ocupado (leyendo/dictando) se reenruta al volver al reposo (Assistant.goIdle).
+        if (running && !Assistant.busy && BtAudio.ensure(this)) Assistant.audioRouteChanged()
+    }
+
+    private val deviceCb = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) = scheduleRouteCheck()
+        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) = scheduleRouteCheck()
+    }
+
+    /** Agrupa ráfagas de eventos (un casco aparece como varios dispositivos a la vez). */
+    private fun scheduleRouteCheck() {
+        h.removeCallbacks(routeCheck)
+        h.postDelayed(routeCheck, 300)
+    }
+
+    private val PERIODIC_MS = 30 * 60_000L
+
+    /** Cada 30 min: buscar actualización y, si falta, bajar el modelo de voz (ambos solo por Wi-Fi). */
+    private val periodic = object : Runnable {
         override fun run() {
             if (!running) return
-            if (!Assistant.busy && BtAudio.ensure(this@DrivingService)) Assistant.audioRouteChanged()
             Updater.check(this@DrivingService, force = false)
-            h.postDelayed(this, 10000)
+            VoskModel.ensure(this@DrivingService)
+            h.postDelayed(this, PERIODIC_MS)
         }
     }
 
@@ -100,6 +124,8 @@ class DrivingService : Service() {
     override fun onDestroy() {
         _state.value = false
         h.removeCallbacksAndMessages(null)
+        try { getSystemService(AudioManager::class.java).unregisterAudioDeviceCallback(deviceCb) } catch (_: Exception) {}
+        Prefs.flush()
         Assistant.stop()
         BtAudio.release(this)
         super.onDestroy()

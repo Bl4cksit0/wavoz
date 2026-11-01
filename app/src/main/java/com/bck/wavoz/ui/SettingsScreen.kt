@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Accessibility
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Hearing
@@ -28,6 +29,9 @@ import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -47,6 +51,7 @@ import com.bck.wavoz.MainActivity
 import com.bck.wavoz.PermState
 import com.bck.wavoz.Prefs
 import com.bck.wavoz.Updater
+import com.bck.wavoz.VoskModel
 import kotlin.math.roundToInt
 
 @Composable
@@ -120,6 +125,41 @@ private fun ListeningCard(a: MainActivity) {
         ) { helmet = it; Prefs.helmetMic = it; a.restartIfRunning() }
         SwitchRow("Preguntar si querés responder", askReply, "Después de leer cada mensaje") {
             askReply = it; Prefs.askReply = it
+        }
+        VoiceModelRow(a)
+    }
+}
+
+/** Estado del modelo de voz offline (se descarga aparte, no viene en la APK). */
+@Composable
+private fun VoiceModelRow(a: MainActivity) {
+    val st by VoskModel.state.collectAsState()
+    val (title, sub) = when (val s = st) {
+        VoskModel.State.Ready -> "Modelo de voz offline listo" to "Comandos y sí/no al instante, sin internet"
+        VoskModel.State.Installed -> "Modelo de voz offline descargado" to "Se carga al iniciar el asistente"
+        VoskModel.State.Loading -> "Cargando modelo de voz…" to null
+        is VoskModel.State.Downloading -> "Descargando modelo de voz: ${s.percent}%" to "Unos 40 MB, una sola vez"
+        VoskModel.State.WaitingWifi -> "Falta el modelo de voz offline" to "Se descarga solo con Wi-Fi (unos 40 MB). Sin él no funcionan los comandos de voz."
+        VoskModel.State.Missing -> "Falta el modelo de voz offline" to "Unos 40 MB. Sin él no funcionan los comandos de voz."
+        is VoskModel.State.Error -> "No se pudo bajar el modelo de voz" to s.msg
+    }
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.CloudDownload, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                if (sub != null) Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        (st as? VoskModel.State.Downloading)?.let {
+            LinearProgressIndicator(progress = { it.percent / 100f }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+        }
+        if (st is VoskModel.State.Missing || st is VoskModel.State.WaitingWifi || st is VoskModel.State.Error) {
+            OutlinedButton(
+                onClick = { VoskModel.ensure(a, allowMetered = true) },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).heightIn(min = 48.dp),
+            ) { Text("Descargar ahora") }
         }
     }
 }
